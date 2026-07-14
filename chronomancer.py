@@ -83,10 +83,28 @@ class ChronoUnit(Enum):
     def rank(self) -> int:
         return self.value.rank
 
+# types
+type TimeComponent = tuple[int, ChronoUnit]
+type TimeComponents = tuple[TimeComponent, ...]
+type IntMatrix = tuple[tuple[int, ...], ...]
+
 _UNITS_ASC: Final[tuple[ChronoUnit, ...]] = tuple(
     sorted(ChronoUnit, key=lambda u: u.rank)
 )
 _UNITS_DESC: Final[tuple[ChronoUnit, ...]] = tuple(reversed(_UNITS_ASC))
+
+# hot path for unit lookup by rank
+_UNIT_RANKS_ASC: Final[tuple[int, ...]] = tuple(u.rank for u in _UNITS_ASC)
+_UNIT_RANKS_DESC: Final[tuple[int, ...]] = tuple(u.rank for u in _UNITS_DESC)
+_US_FACTORS_BY_RANK: Final[tuple[int, ...]] = (
+    _US_PER_US,
+    _US_PER_MS,
+    _US_PER_SEC,
+    _US_PER_MIN,
+    _US_PER_HOUR,
+    _US_PER_DAY,
+    _US_PER_WEEK,
+)
 
 # Canonical decomposition divisor table.
 #
@@ -97,7 +115,6 @@ _UNITS_DESC: Final[tuple[ChronoUnit, ...]] = tuple(reversed(_UNITS_ASC))
 #
 # Unit order:
 # microsecond, millisecond, second, minute, hour, day, week
-type IntMatrix = tuple[tuple[int, ...], ...]
 _DECOMPOSITION_DIVISORS: Final[IntMatrix] = tuple(
     tuple(
         0
@@ -145,7 +162,7 @@ class ChronoDelta:
         microseconds = _require_integer(microseconds, "microseconds")
         
         if (weeks < 0 or days < 0 or hours < 0 or minutes < 0 or seconds < 0 or milliseconds < 0 or microseconds < 0):
-            raise ValueError("All time components must be non-negative")
+            raise ValueError("All time component values must be non-negative")
         
         total_us = (
             weeks * _US_PER_WEEK +
@@ -172,6 +189,11 @@ class ChronoDelta:
 
     @classmethod
     def from_total_us(cls, total_us: int) -> ChronoDelta:
+        """
+        A canonical entrance for initializing a ChronoDelta.
+        Returns a normalized (decomposed) instance.
+        """
+        
         total_us = _require_integer(total_us, "total_us")
         
         if total_us == 0:
@@ -196,6 +218,90 @@ class ChronoDelta:
             milliseconds=milliseconds,
             microseconds=microseconds,
             total_us=total_us
+        )
+
+    @classmethod
+    def from_unit(
+        cls,
+        value: int,
+        unit: ChronoUnit,
+        *,
+        weeks: bool = False,
+        days: bool = False,
+        hours: bool = False,
+        minutes: bool = False,
+        seconds: bool = False,
+        milliseconds: bool = False,
+        microseconds: bool = False,
+        truncate: bool = False
+    ) -> ChronoDelta:
+        value = _require_integer(value, "value")
+        
+        if not isinstance(unit, ChronoUnit):
+            raise TypeError(f"unit must be a ChronoUnit, got {type(unit).__name__}")
+        
+        flags = (microseconds, milliseconds, seconds, minutes, hours, days, weeks)
+        use_default_flags = True
+        for flag in flags:
+            if not isinstance(flag, bool):
+                raise TypeError("All time component flags must be boolean values")
+            if flag:
+                use_default_flags = False
+        if use_default_flags:
+            flags = (True,) * 7  # default to all components if none specified
+        
+        truncate = _require_bool(truncate, "truncate")
+        
+        if value == 0:
+            return cls.zero()
+        
+        if use_default_flags:
+            if unit is ChronoUnit.MICROSECOND:
+                return cls.from_total_us(value)
+            
+            return cls.from_total_us(value * unit.us_factor)
+        
+        # lsr: least significant rank of the enabled components
+        lsr = 0
+        for rank, flag in enumerate(flags):
+            if flag:
+                lsr = rank
+                break
+        
+        src_rank = unit.rank
+        total = 0
+        
+        if src_rank <= lsr:
+            lsr = src_rank
+            total = value
+        else:
+            total = value * _DECOMPOSITION_DIVISORS[lsr][src_rank]
+        
+        remaining_value = abs(total)
+        args: list[int] = []
+        
+        for target_rank in _UNIT_RANKS_DESC:
+            component_value = 0
+            
+            if target_rank >= lsr and flags[target_rank]:
+                divisor = _DECOMPOSITION_DIVISORS[lsr][target_rank]
+                
+                if divisor == 1:
+                    component_value = remaining_value
+                    remaining_value = 0
+                else:
+                    component_value, remaining_value = divmod(remaining_value, divisor)
+            
+            args.append(component_value)
+        
+        if remaining_value and not truncate:
+            raise ValueError("Cannot express in the given components without truncation, as there are remaining units")
+        
+        new_total_us = (abs(total) - remaining_value) * _US_FACTORS_BY_RANK[lsr]
+        
+        return cls._from_validated(
+            *args,
+            total_us=-new_total_us if value < 0 else new_total_us
         )
 
     @classmethod
@@ -277,13 +383,13 @@ class ChronoDelta:
         truncate: bool = False
     ) -> ChronoDelta:
         all_false = True
-        for part in (weeks, days, hours, minutes, seconds, milliseconds, microseconds):
-            if not isinstance(part, bool):
+        for flag in (weeks, days, hours, minutes, seconds, milliseconds, microseconds):
+            if not isinstance(flag, bool):
                 raise TypeError("All time component flags must be boolean values")
-            if part:
+            if flag:
                 all_false = False
         if all_false:
-            raise ValueError("At least one time component must be set to True")
+            raise ValueError("At least one time component must be enabled for expression")
         if not isinstance(truncate, bool):
             raise TypeError("truncate must be a boolean value")
         
@@ -336,24 +442,36 @@ class ChronoDelta:
             us=self.microseconds
         )
 
-    def verbose_str(self, show_zero_parts: bool = False) -> str:
-        show_zero_parts = _require_bool(show_zero_parts, "show_zero_parts")
-        parts_shown: list[str] = []
+    def verbose_str(self, show_zero_components: bool = False) -> str:
+        show_zero_components = _require_bool(show_zero_components, "show_zero_components")
+        render_parts: list[str] = []
         
-        for part, unit in self.iter_parts():
-            if part != 0 or show_zero_parts:
-                parts_shown.append(
+        for value, unit in self.components:
+            if value != 0 or show_zero_components:
+                render_parts.append(
                     # 0 = time value, 1 = unit name, 2 = plural 's' if needed
                     "{0} {1}{2}".format(
-                        part,
+                        value,
                         unit.meta.name,
-                        's' if part != 1 else ''
+                        's' if value != 1 else ''
                     )
                 )
         
-        joined = ", ".join(parts_shown)
+        joined = ", ".join(render_parts)
         joined = f"-{joined}" if self.total_us < 0 else joined
         return joined if joined else "0 microseconds"
+
+    @property
+    def components(self) -> TimeComponents:
+        return (
+            (self.weeks, ChronoUnit.WEEK),
+            (self.days, ChronoUnit.DAY),
+            (self.hours, ChronoUnit.HOUR),
+            (self.minutes, ChronoUnit.MINUTE),
+            (self.seconds, ChronoUnit.SECOND),
+            (self.milliseconds, ChronoUnit.MILLISECOND),
+            (self.microseconds, ChronoUnit.MICROSECOND),
+        )
 
     @property
     def total_seconds(self) -> float:
@@ -391,7 +509,7 @@ class ChronoDelta:
     def sign(self) -> Literal[-1, 0, 1]:
         return 1 if self.is_positive else -1 if self.is_negative else 0
 
-    def iter_parts(self) -> Iterator[tuple[int, ChronoUnit]]:
+    def iter_components(self) -> Iterator[TimeComponent]:
         yield self.weeks, ChronoUnit.WEEK
         yield self.days, ChronoUnit.DAY
         yield self.hours, ChronoUnit.HOUR
