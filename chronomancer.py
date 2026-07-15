@@ -4,15 +4,10 @@ from dataclasses import dataclass
 from datetime import timedelta
 from types import NotImplementedType
 from functools import total_ordering, cache
-from collections.abc import Iterator, Callable
-from typing import Literal, Final, overload
+from collections.abc import Iterator
+from typing import Literal, Final, Any, overload
 from numbers import Integral
-
-def _integer_like(value: object) -> bool:
-    if type(value) is int:
-        return True
-    
-    return isinstance(value, Integral) and not isinstance(value, bool)
+from string import Formatter
 
 def _require_integer(value: object, name: str) -> int:
     # fast path for int type, since it's the most common case
@@ -26,11 +21,6 @@ def _require_integer(value: object, name: str) -> int:
 def _require_bool(value: object, name: str) -> bool:
     if not isinstance(value, bool):
         raise TypeError(f"{name} must be a boolean, got {type(value).__name__}")
-    return value
-
-def _require_str(value: object, name: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{name} must be a string, got {type(value).__name__}")
     return value
 
 # New standards, us as a canonical unit
@@ -94,17 +84,8 @@ _UNITS_ASC: Final[tuple[ChronoUnit, ...]] = tuple(
 _UNITS_DESC: Final[tuple[ChronoUnit, ...]] = tuple(reversed(_UNITS_ASC))
 
 # hot path for unit lookup by rank
-_UNIT_RANKS_ASC: Final[tuple[int, ...]] = tuple(u.rank for u in _UNITS_ASC)
 _UNIT_RANKS_DESC: Final[tuple[int, ...]] = tuple(u.rank for u in _UNITS_DESC)
-_US_FACTORS_BY_RANK: Final[tuple[int, ...]] = (
-    _US_PER_US,
-    _US_PER_MS,
-    _US_PER_SEC,
-    _US_PER_MIN,
-    _US_PER_HOUR,
-    _US_PER_DAY,
-    _US_PER_WEEK,
-)
+_US_FACTORS_BY_RANK: Final[tuple[int, ...]] = tuple(u.us_factor for u in _UNITS_ASC)
 
 # Canonical decomposition divisor table.
 #
@@ -127,6 +108,17 @@ _DECOMPOSITION_DIVISORS: Final[IntMatrix] = tuple(
 
 # timedelta supports
 _SEC_PER_DAY: Final[int] = 86_400
+
+# for getattr()
+_DELTA_COMPONENT_NAMES: Final[tuple[str, ...]] = (
+    "weeks",
+    "days",
+    "hours",
+    "minutes",
+    "seconds",
+    "milliseconds",
+    "microseconds",
+)
 
 @total_ordering
 @dataclass(frozen=True, slots=True, init=False)
@@ -619,3 +611,222 @@ class ChronoDelta:
             self.microseconds,
             total_us=-self.total_us
         )
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DeltaFormatSpec:
+    weeks:        str | None = None
+    days:         str | None = None
+    hours:        str | None = None
+    minutes:      str | None = None
+    seconds:      str | None = None
+    milliseconds: str | None = None
+    microseconds: str | None = None
+    
+    sign: Literal["-", "+-", None] = "-"
+    separator: str = ""
+    show_zero_components: bool = False
+
+    def __post_init__(self) -> None:
+        for component in (self.weeks, self.days, self.hours, self.minutes, self.seconds, self.milliseconds, self.microseconds):
+            if component is not None and not isinstance(component, str):
+                raise TypeError("All component format strings must be either None or a string")
+        
+        if self.sign not in ("-", "+-", None):
+            raise ValueError("sign must be one of '-', '+-', or None")
+        if not isinstance(self.separator, str):
+            raise TypeError("separator must be a string")
+        if not isinstance(self.show_zero_components, bool):
+            raise TypeError("show_zero_components must be a boolean")
+
+type DeltaFormatter = _DeltaFormatter
+_SUPPORTED_PLACEHOLDERS: Final[frozenset[str]] = frozenset({
+    "value",
+    "name",
+    "abbr",
+    "symbol",
+    "plural",
+})
+
+# op codes
+GET_VALUE = 0
+GET_PLURAL = 1
+
+@dataclass(frozen=True, slots=True)
+class _ComponentFormatPlan:
+    fmt_str: str # compiled format string for the component
+    component_name: str # field name of the component in ChronoDelta
+    ops: tuple[int, ...] # use int for op codes to avoid string comparisons at runtime
+
+class _DeltaFormatter:
+    __slots__ = (
+        "_plans",
+        "_neg_sign",
+        "_pos_sign",
+        "_separator",
+        "_show_zero_components",
+        "_fixed_fmt_str",
+    )
+
+    def __init__(
+        self,
+        plans: tuple[_ComponentFormatPlan, ...],
+        sign: Literal["-", "+-", None],
+        separator: str,
+        show_zero_components: bool
+    ) -> None:
+        self._plans = plans
+        self._neg_sign = "-" if sign is not None else ""
+        self._pos_sign = "+" if sign == "+-" else ""
+        self._separator = separator
+        self._show_zero_components = show_zero_components
+        
+        self._fixed_fmt_str: str | None = None
+        # If all components are included in the format, we can precompute a fixed format string for performance
+        if show_zero_components:
+            self._fixed_fmt_str = self._separator.join(
+                plan.fmt_str for plan in plans
+            )
+
+    def format(self, delta: ChronoDelta) -> str:
+        if not isinstance(delta, ChronoDelta):
+            raise TypeError(f"delta must be a ChronoDelta, got {type(delta).__name__}")
+        
+        # fixed format string == "" means no components to render, return empty string
+        if self._fixed_fmt_str == "":
+            return ""
+        
+        render_parts: list[str] = []
+        render_args: list[Any] = []
+        
+        for plan in self._plans:
+            value = getattr(delta, plan.component_name)
+            
+            if value == 0 and not self._show_zero_components:
+                continue
+            
+            if self._fixed_fmt_str is None:
+                render_parts.append(plan.fmt_str)
+            
+            for op in plan.ops:
+                if op == GET_VALUE:
+                    render_args.append(value)
+                elif op == GET_PLURAL:
+                    render_args.append("s" if value != 1 else "")
+        
+        sign = (
+            self._neg_sign
+            if delta.is_negative
+            else self._pos_sign
+            if delta.is_positive
+            else ""
+        )
+        
+        # if fixed_fmt_str is available, render and return it before the empty render_parts get handled as a special case
+        if self._fixed_fmt_str is not None:
+            return sign + self._fixed_fmt_str.format(*render_args)
+        
+        # handle special cases first for performance
+        if not render_parts:
+            if delta.is_zero and not self._show_zero_components:
+                return "0 microseconds"
+            return ""
+        
+        return sign + self._separator.join(render_parts).format(*render_args)
+
+def _format_value(value: Any, spec: str | None, conversion: str | None) -> str:
+    # Avoid redundant format() calls for common cases where no spec or conversion is provided
+    if spec is None and conversion is None:
+        # Avoid redundant str() calls
+        if isinstance(value, str):
+            return value
+        
+        return str(value)
+    
+    if conversion is not None:
+        if conversion == "s":
+            value = str(value)
+        elif conversion == "r":
+            value = repr(value)
+        elif conversion == "a":
+            value = ascii(value)
+    
+    return format(value, spec if spec is not None else "")
+
+def _build_dynamic_field(format_spec: str | None, conversion: str | None) -> str:
+    return (
+        "{"
+        + (f"!{conversion}" if conversion is not None else "")
+        + (f":{format_spec}" if format_spec is not None else "")
+        + "}"
+    )
+
+def create_delta_formatter(spec: DeltaFormatSpec) -> DeltaFormatter:
+    if not isinstance(spec, DeltaFormatSpec):
+        raise TypeError(f"spec must be a DeltaFormatSpec, got {type(spec).__name__}")
+    
+    plans: list[_ComponentFormatPlan] = []
+    
+    for i, raw_fmt_str in enumerate((
+        spec.weeks,
+        spec.days,
+        spec.hours,
+        spec.minutes,
+        spec.seconds,
+        spec.milliseconds,
+        spec.microseconds
+    )):
+        if raw_fmt_str is None:
+            continue
+        
+        parts: list[str] = []
+        ops: list[int] = []
+        unit = _UNITS_DESC[i]
+        for literal, field_name, format_spec, conversion in Formatter().parse(raw_fmt_str):
+            parts.append(
+                literal.replace("{", "{{").replace("}", "}}")
+            )
+            
+            if field_name is None:
+                continue
+            if field_name not in _SUPPORTED_PLACEHOLDERS:
+                raise ValueError(f"Unsupported placeholder '{field_name}' in format string for {unit.symbol}")
+            
+            if format_spec and (
+                "{" in format_spec or "}" in format_spec
+            ):
+                raise ValueError(f"Nested replacement fields are not supported")
+            
+            if conversion not in (None, "s", "r", "a"):
+                raise ValueError(f"Unsupported conversion '!{conversion}'")
+            
+            match field_name:
+                case "value":
+                    ops.append(GET_VALUE)
+                    parts.append(_build_dynamic_field(format_spec, conversion))
+                case "plural":
+                    ops.append(GET_PLURAL)
+                    parts.append(_build_dynamic_field(format_spec, conversion))
+                case "name":
+                    parts.append(_format_value(unit.meta.name, format_spec, conversion))
+                case "abbr":
+                    parts.append(_format_value(unit.meta.abbr, format_spec, conversion))
+                case "symbol":
+                    parts.append(_format_value(unit.symbol, format_spec, conversion))
+                case _:
+                    raise ValueError(f"Unsupported placeholder '{field_name}' in format string for {unit.symbol}")
+        
+        # finished handling parsed format string, a format plan now can be created for this component
+        plans.append(
+            _ComponentFormatPlan(
+                fmt_str="".join(parts),
+                component_name=_DELTA_COMPONENT_NAMES[i],
+                ops=tuple(ops)
+            )
+        )
+    
+    return _DeltaFormatter(
+        plans=tuple(plans),
+        sign=spec.sign,
+        separator=spec.separator,
+        show_zero_components=spec.show_zero_components
+    )
