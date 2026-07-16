@@ -74,9 +74,9 @@ class ChronoUnit(Enum):
         return self.value.rank
 
 # types
-type TimeComponent = tuple[int, ChronoUnit]
-type TimeComponents = tuple[TimeComponent, ...]
-type IntMatrix = tuple[tuple[int, ...], ...]
+TimeComponent = tuple[int, ChronoUnit]
+TimeComponents = tuple[TimeComponent, ...]
+IntMatrix = tuple[tuple[int, ...], ...]
 
 _UNITS_ASC: Final[tuple[ChronoUnit, ...]] = tuple(
     sorted(ChronoUnit, key=lambda u: u.rank)
@@ -349,12 +349,28 @@ class ChronoDelta:
         )
 
     @classmethod
-    def from_timedelta(cls, td: timedelta) -> ChronoDelta:
+    def from_timedelta(
+        cls,
+        td: timedelta,
+        /,
+        **options: bool
+    ) -> ChronoDelta:
         if not isinstance(td, timedelta):
             raise TypeError(f"td must be a timedelta, got {type(td).__name__}")
         
-        total_us = (td.days * _SEC_PER_DAY + td.seconds) * _US_PER_SEC + td.microseconds
-        return cls.from_total_us(total_us)
+        total_us = (
+            (td.days * _SEC_PER_DAY + td.seconds) * _US_PER_SEC
+            + td.microseconds
+        )
+        
+        if not options:
+            return cls.from_total_us(total_us)
+        
+        return cls.from_unit(
+            value=total_us,
+            unit=ChronoUnit.MICROSECOND,
+            **options
+        )
 
     def to_timedelta(self) -> timedelta:
         return timedelta(microseconds=self.total_us)
@@ -638,7 +654,6 @@ class DeltaFormatSpec:
         if not isinstance(self.show_zero_components, bool):
             raise TypeError("show_zero_components must be a boolean")
 
-type DeltaFormatter = _DeltaFormatter
 _SUPPORTED_PLACEHOLDERS: Final[frozenset[str]] = frozenset({
     "value",
     "name",
@@ -657,7 +672,7 @@ class _ComponentFormatPlan:
     component_name: str # field name of the component in ChronoDelta
     ops: tuple[int, ...] # use int for op codes to avoid string comparisons at runtime
 
-class _DeltaFormatter:
+class DeltaFormatter:
     __slots__ = (
         "_plans",
         "_neg_sign",
@@ -824,7 +839,7 @@ def create_delta_formatter(spec: DeltaFormatSpec) -> DeltaFormatter:
             )
         )
     
-    return _DeltaFormatter(
+    return DeltaFormatter(
         plans=tuple(plans),
         sign=spec.sign,
         separator=spec.separator,
