@@ -23,6 +23,9 @@ def _require_bool(value: object, name: str) -> bool:
         raise TypeError(f"{name} must be a boolean, got {type(value).__name__}")
     return value
 
+def _get_plural(x: int) -> str:
+    return "" if x == 1 else "s"
+
 # New standards, us as a canonical unit
 _US_PER_US  : Final[int] = 1
 _US_PER_MS  : Final[int] = 1_000
@@ -450,24 +453,88 @@ class ChronoDelta:
             us=self.microseconds
         )
 
-    def verbose_str(self, show_zero_components: bool = False) -> str:
+    def verbose_str(
+        self, 
+        *,
+        weeks: bool = False,
+        days: bool = False,
+        hours: bool = False,
+        minutes: bool = False,
+        seconds: bool = False,
+        milliseconds: bool = False,
+        microseconds: bool = False,
+        show_zero_components: bool = False,
+        zero_fallback: str = "0 microseconds"
+    ) -> str:
+        all_enabled = True
+        
+        for component in (weeks, days, hours, minutes, seconds, milliseconds, microseconds):
+            if not isinstance(component, bool):
+                raise TypeError("All time component flags must be boolean values")
+            if component:
+                all_enabled = False
+        
         show_zero_components = _require_bool(show_zero_components, "show_zero_components")
-        render_parts: list[str] = []
         
-        for value, unit in self.components:
-            if value != 0 or show_zero_components:
-                render_parts.append(
-                    # 0 = time value, 1 = unit name, 2 = plural 's' if needed
-                    "{0} {1}{2}".format(
-                        value,
-                        unit.meta.name,
-                        's' if value != 1 else ''
-                    )
+        if not isinstance(zero_fallback, str):
+            raise TypeError("zero_fallback must be a string")
+        
+        if show_zero_components:
+            sign = '-' if self.is_negative else ''
+            
+            if all_enabled:
+                return (
+                    f"{sign}{self.weeks} week{_get_plural(self.weeks)}, "
+                    f"{self.days} day{_get_plural(self.days)}, "
+                    f"{self.hours} hour{_get_plural(self.hours)}, "
+                    f"{self.minutes} minute{_get_plural(self.minutes)}, "
+                    f"{self.seconds} second{_get_plural(self.seconds)}, "
+                    f"{self.milliseconds} millisecond{_get_plural(self.milliseconds)}, "
+                    f"{self.microseconds} microsecond{_get_plural(self.microseconds)}"
                 )
-        
-        joined = ", ".join(render_parts)
-        joined = f"-{joined}" if self.total_us < 0 else joined
-        return joined if joined else "0 microseconds"
+            
+            parts: list[str] = []
+            
+            if weeks:
+                parts.append(f"{self.weeks} week{_get_plural(self.weeks)}")
+            if days:
+                parts.append(f"{self.days} day{_get_plural(self.days)}")
+            if hours:
+                parts.append(f"{self.hours} hour{_get_plural(self.hours)}")
+            if minutes:
+                parts.append(f"{self.minutes} minute{_get_plural(self.minutes)}")
+            if seconds:
+                parts.append(f"{self.seconds} second{_get_plural(self.seconds)}")
+            if milliseconds:
+                parts.append(f"{self.milliseconds} millisecond{_get_plural(self.milliseconds)}")
+            if microseconds:
+                parts.append(f"{self.microseconds} microsecond{_get_plural(self.microseconds)}")
+            
+            return sign + ", ".join(parts)
+        else:
+            parts: list[str] = []
+            
+            if (weeks or all_enabled) and self.weeks:
+                parts.append(f"{self.weeks} week{_get_plural(self.weeks)}")
+            if (days or all_enabled) and self.days:
+                parts.append(f"{self.days} day{_get_plural(self.days)}")
+            if (hours or all_enabled) and self.hours:
+                parts.append(f"{self.hours} hour{_get_plural(self.hours)}")
+            if (minutes or all_enabled) and self.minutes:
+                parts.append(f"{self.minutes} minute{_get_plural(self.minutes)}")
+            if (seconds or all_enabled) and self.seconds:
+                parts.append(f"{self.seconds} second{_get_plural(self.seconds)}")
+            if (milliseconds or all_enabled) and self.milliseconds:
+                parts.append(f"{self.milliseconds} millisecond{_get_plural(self.milliseconds)}")
+            if (microseconds or all_enabled) and self.microseconds:
+                parts.append(f"{self.microseconds} microsecond{_get_plural(self.microseconds)}")
+            
+            if not parts:
+                if self.is_zero:
+                    return zero_fallback
+                return ""
+            
+            return ("-" if self.is_negative else "") + ", ".join(parts)
 
     @property
     def components(self) -> TimeComponents:
