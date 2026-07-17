@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py-chronomancer"
-version = "0.1.0"
-description = "A focused Python library for precise duration representation, decomposition, and highly customizable compiled formatting."
+version = "0.2.0"
+description = "A Python library for highly flexible formatting and representation of pure, signed durations from weeks to microseconds."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
