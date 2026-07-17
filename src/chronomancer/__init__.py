@@ -1,15 +1,17 @@
 from ._core import (
     ChronoUnit,
     ChronoDelta,
+    FormatPart,
+    Part,
     DeltaFormatSpec,
     DeltaFormatter,
-    create_delta_formatter,
 )
 
 __all__ = [
     "ChronoUnit",
     "ChronoDelta",
+    "FormatPart",
+    "Part",
     "DeltaFormatSpec",
     "DeltaFormatter",
-    "create_delta_formatter",
 ]

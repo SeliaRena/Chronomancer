@@ -628,105 +628,122 @@ class ChronoDelta:
             total_us=-self.total_us
         )
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class DeltaFormatSpec:
-    weeks:        str | None = None
-    days:         str | None = None
-    hours:        str | None = None
-    minutes:      str | None = None
-    seconds:      str | None = None
-    milliseconds: str | None = None
-    microseconds: str | None = None
-    
-    sign: Literal["-", "+-", None] = "-"
-    separator: str = ""
-    show_zero_components: bool = False
+@dataclass(frozen=True, slots=True)
+class FormatPart:
+    fmt: str
+    show_zero: bool = False
 
     def __post_init__(self) -> None:
-        for component in (self.weeks, self.days, self.hours, self.minutes, self.seconds, self.milliseconds, self.microseconds):
-            if component is not None and not isinstance(component, str):
-                raise TypeError("All component format strings must be either None or a string")
+        if not isinstance(self.fmt, str):
+            raise TypeError("fmt must be a string")
+        if not isinstance(self.show_zero, bool):
+            raise TypeError("show_zero must be a bool")
+
+Part = FormatPart
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DeltaFormatSpec:
+    weeks:        FormatPart | None = None
+    days:         FormatPart | None = None
+    hours:        FormatPart | None = None
+    minutes:      FormatPart | None = None
+    seconds:      FormatPart | None = None
+    milliseconds: FormatPart | None = None
+    microseconds: FormatPart | None = None
+    
+    common_separator: str | None = None
+    sign: Literal["-", "+-", None] = "-"
+    zero_fallback: str = "0 microseconds"
+
+    def __post_init__(self) -> None:
+        for component in (
+            self.weeks,
+            self.days,
+            self.hours,
+            self.minutes,
+            self.seconds,
+            self.milliseconds,
+            self.microseconds
+        ):
+            if component is not None and not isinstance(component, FormatPart):
+                raise TypeError("All components must be FormatPart instances or None")
         
+        if self.common_separator is not None and not isinstance(self.common_separator, str):
+            raise TypeError("common_separator must be a string")
         if self.sign not in ("-", "+-", None):
             raise ValueError("sign must be one of '-', '+-', or None")
-        if not isinstance(self.separator, str):
-            raise TypeError("separator must be a string")
-        if not isinstance(self.show_zero_components, bool):
-            raise TypeError("show_zero_components must be a boolean")
-
-_SUPPORTED_PLACEHOLDERS: Final[frozenset[str]] = frozenset({
-    "value",
-    "name",
-    "abbr",
-    "symbol",
-    "plural",
-})
+        if not isinstance(self.zero_fallback, str):
+            raise TypeError("zero_fallback must be a string")
 
 # op codes
 GET_VALUE = 0
-GET_PLURAL = 1
+HANDLE_INLINE_SEPARATOR = 1
+HANDLE_PLURAL = 2
 
 @dataclass(frozen=True, slots=True)
 class _ComponentFormatPlan:
-    fmt_str: str # compiled format string for the component
+    fmt: str # compiled format string for the component
     component_name: str # field name of the component in ChronoDelta
     ops: tuple[int, ...] # use int for op codes to avoid string comparisons at runtime
+    show_zero: bool
+    inline_separator: str | None = None
+    plural: str | None = None
+
+def _build_dynamic_field(format_spec: str | None, conversion: str | None) -> str:
+    return (
+        "{"
+        + (f"!{conversion}" if conversion is not None else "")
+        + (f":{format_spec}" if format_spec is not None else "")
+        + "}"
+    )
 
 class DeltaFormatter:
     __slots__ = (
         "_plans",
         "_neg_sign",
         "_pos_sign",
-        "_separator",
-        "_show_zero_components",
-        "_fixed_fmt_str",
+        "_common_separator",
+        "_zero_fallback",
+        "_fixed_fmt",
     )
 
-    def __init__(
-        self,
-        plans: tuple[_ComponentFormatPlan, ...],
-        sign: Literal["-", "+-", None],
-        separator: str,
-        show_zero_components: bool
-    ) -> None:
-        self._plans = plans
-        self._neg_sign = "-" if sign is not None else ""
-        self._pos_sign = "+" if sign == "+-" else ""
-        self._separator = separator
-        self._show_zero_components = show_zero_components
-        
-        self._fixed_fmt_str: str | None = None
-        # If all components are included in the format, we can precompute a fixed format string for performance
-        if show_zero_components:
-            self._fixed_fmt_str = self._separator.join(
-                plan.fmt_str for plan in plans
-            )
+    def __init__(self, spec: DeltaFormatSpec) -> None:
+        self._compile_spec(spec)
 
     def format(self, delta: ChronoDelta) -> str:
         if not isinstance(delta, ChronoDelta):
             raise TypeError(f"delta must be a ChronoDelta, got {type(delta).__name__}")
         
         # fixed format string == "" means no components to render, return empty string
-        if self._fixed_fmt_str == "":
+        if self._fixed_fmt == "":
             return ""
         
         render_parts: list[str] = []
         render_args: list[Any] = []
+        render_count = 0
         
         for plan in self._plans:
             value = getattr(delta, plan.component_name)
             
-            if value == 0 and not self._show_zero_components:
+            if value == 0 and not plan.show_zero:
                 continue
             
-            if self._fixed_fmt_str is None:
-                render_parts.append(plan.fmt_str)
+            if self._fixed_fmt is None:
+                render_parts.append(plan.fmt)
             
             for op in plan.ops:
+                # invariant: op code exists when value exists. This is enforced by _compile_spec
+                # for example if there's HANDLE_INLINE_SEPARATOR op, then the separator must exist
                 if op == GET_VALUE:
                     render_args.append(value)
-                elif op == GET_PLURAL:
-                    render_args.append("s" if value != 1 else "")
+                elif op == HANDLE_INLINE_SEPARATOR:
+                    render_args.append(plan.inline_separator if render_count > 0 else "")
+                elif op == HANDLE_PLURAL:
+                    render_args.append(plan.plural if value != 1 else "")
+                else:
+                    raise ValueError(f"Unknown op code {op}")
+            
+            render_count += 1
         
         sign = (
             self._neg_sign
@@ -737,111 +754,109 @@ class DeltaFormatter:
         )
         
         # if fixed_fmt_str is available, render and return it before the empty render_parts get handled as a special case
-        if self._fixed_fmt_str is not None:
-            return sign + self._fixed_fmt_str.format(*render_args)
+        if self._fixed_fmt is not None:
+            return sign + self._fixed_fmt.format(*render_args)
         
         # handle special cases first for performance
         if not render_parts:
-            if delta.is_zero and not self._show_zero_components:
-                return "0 microseconds"
+            if delta.is_zero:
+                return self._zero_fallback
             return ""
         
-        return sign + self._separator.join(render_parts).format(*render_args)
-
-def _format_value(value: Any, spec: str | None, conversion: str | None) -> str:
-    # Avoid redundant format() calls for common cases where no spec or conversion is provided
-    if spec is None and conversion is None:
-        # Avoid redundant str() calls
-        if isinstance(value, str):
-            return value
+        if self._common_separator is not None:
+            return sign + self._common_separator.join(render_parts).format(*render_args)
         
-        return str(value)
-    
-    if conversion is not None:
-        if conversion == "s":
-            value = str(value)
-        elif conversion == "r":
-            value = repr(value)
-        elif conversion == "a":
-            value = ascii(value)
-    
-    return format(value, spec if spec is not None else "")
+        return sign + "".join(render_parts).format(*render_args)
 
-def _build_dynamic_field(format_spec: str | None, conversion: str | None) -> str:
-    return (
-        "{"
-        + (f"!{conversion}" if conversion is not None else "")
-        + (f":{format_spec}" if format_spec is not None else "")
-        + "}"
-    )
-
-def create_delta_formatter(spec: DeltaFormatSpec) -> DeltaFormatter:
-    if not isinstance(spec, DeltaFormatSpec):
-        raise TypeError(f"spec must be a DeltaFormatSpec, got {type(spec).__name__}")
-    
-    plans: list[_ComponentFormatPlan] = []
-    
-    for i, raw_fmt_str in enumerate((
-        spec.weeks,
-        spec.days,
-        spec.hours,
-        spec.minutes,
-        spec.seconds,
-        spec.milliseconds,
-        spec.microseconds
-    )):
-        if raw_fmt_str is None:
-            continue
+    def _compile_spec(self, spec: DeltaFormatSpec) -> None:
+        if not isinstance(spec, DeltaFormatSpec):
+            raise TypeError(f"spec must be a DeltaFormatSpec, got {type(spec).__name__}")
         
-        parts: list[str] = []
-        ops: list[int] = []
-        unit = _UNITS_DESC[i]
-        for literal, field_name, format_spec, conversion in Formatter().parse(raw_fmt_str):
-            parts.append(
-                literal.replace("{", "{{").replace("}", "}}")
-            )
-            
-            if field_name is None:
+        plans: list[_ComponentFormatPlan] = []
+        
+        for i, fmt_part in enumerate((
+            spec.weeks,
+            spec.days,
+            spec.hours,
+            spec.minutes,
+            spec.seconds,
+            spec.milliseconds,
+            spec.microseconds
+        )):
+            if fmt_part is None:
                 continue
-            if field_name not in _SUPPORTED_PLACEHOLDERS:
-                raise ValueError(f"Unsupported placeholder '{field_name}' in format string for {unit.symbol}")
             
-            if format_spec and (
-                "{" in format_spec or "}" in format_spec
-            ):
-                raise ValueError(f"Nested replacement fields are not supported")
+            raw_fmt = fmt_part.fmt
+            parts: list[str] = []
+            ops: list[int] = []
+            inline_separator: str | None = None
+            plural: str | None = None
             
-            if conversion not in (None, "s", "r", "a"):
-                raise ValueError(f"Unsupported conversion '!{conversion}'")
-            
-            match field_name:
-                case "value":
+            for literal, field_name, format_spec, conversion in Formatter().parse(raw_fmt):
+                parts.append(
+                    literal.replace("{", "{{").replace("}", "}}")
+                )
+                
+                if field_name is None:
+                    continue
+                
+                if field_name == "":
+                    raise ValueError("Automatic positional fields are not supported")
+                
+                if format_spec and (
+                    "{" in format_spec or "}" in format_spec
+                ):
+                    raise ValueError(f"Nested replacement fields are not supported")
+                
+                if conversion not in (None, "s", "r", "a"):
+                    raise ValueError(f"Unsupported conversion '!{conversion}'")
+                
+                if field_name == "val":
                     ops.append(GET_VALUE)
                     parts.append(_build_dynamic_field(format_spec, conversion))
-                case "plural":
-                    ops.append(GET_PLURAL)
+                elif field_name[0] == "|":
+                    if inline_separator is not None:
+                        raise ValueError("Multiple inline separators are not allowed in a single component format string")
+                    elif spec.common_separator is not None:
+                        raise ValueError("Inline separator is not allowed when common separator is set")
+                    
+                    ops.append(HANDLE_INLINE_SEPARATOR)
                     parts.append(_build_dynamic_field(format_spec, conversion))
-                case "name":
-                    parts.append(_format_value(unit.meta.name, format_spec, conversion))
-                case "abbr":
-                    parts.append(_format_value(unit.meta.abbr, format_spec, conversion))
-                case "symbol":
-                    parts.append(_format_value(unit.symbol, format_spec, conversion))
-                case _:
-                    raise ValueError(f"Unsupported placeholder '{field_name}' in format string for {unit.symbol}")
-        
-        # finished handling parsed format string, a format plan now can be created for this component
-        plans.append(
-            _ComponentFormatPlan(
-                fmt_str="".join(parts),
-                component_name=_DELTA_COMPONENT_NAMES[i],
-                ops=tuple(ops)
+                    inline_separator = field_name[1:] if len(field_name) > 1 else ""
+                elif field_name[0] == "(" and field_name[-1] == ")":
+                    if plural is not None:
+                        raise ValueError("Multiple plural forms are not allowed in a single component format string")
+                    
+                    ops.append(HANDLE_PLURAL)
+                    parts.append(_build_dynamic_field(format_spec, conversion))
+                    plural = field_name[1:-1] if len(field_name) > 2 else ""
+                else:
+                    raise ValueError(f"Unsupported placeholder '{field_name}'")
+            
+            plans.append(
+                _ComponentFormatPlan(
+                    fmt="".join(parts),
+                    component_name=_DELTA_COMPONENT_NAMES[i],
+                    ops=tuple(ops),
+                    show_zero=fmt_part.show_zero,
+                    inline_separator=inline_separator,
+                    plural=plural,
+                )
             )
-        )
-    
-    return DeltaFormatter(
-        plans=tuple(plans),
-        sign=spec.sign,
-        separator=spec.separator,
-        show_zero_components=spec.show_zero_components
-    )
+        
+        self._plans: tuple[_ComponentFormatPlan, ...] = tuple(plans)
+        self._neg_sign: str = "-" if spec.sign is not None else ""
+        self._pos_sign: str = "+" if spec.sign == "+-" else ""
+        self._common_separator: str | None = spec.common_separator
+        self._zero_fallback: str = spec.zero_fallback
+        
+        if all(plan.show_zero for plan in self._plans):
+            sep = (
+                self._common_separator
+                if self._common_separator is not None
+                else "" 
+            )
+            
+            self._fixed_fmt = sep.join(plan.fmt for plan in self._plans)
+        else:
+            self._fixed_fmt = None
