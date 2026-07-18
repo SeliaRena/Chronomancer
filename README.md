@@ -10,7 +10,7 @@ It provides flexible duration formatting for outputs such as:
 
 * `02:03:04`
 * `2 weeks 3 days 03:04:05`
-* `3 hour watermelons, 4seconds:::0001ms??0002microseconds`
+* `3 hour watermelons, 4seconds,,,0001ms??0002microseconds`
 
 Even unusual formats can be expressed without filling your application code with custom formatting logic.
 
